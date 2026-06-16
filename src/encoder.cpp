@@ -127,7 +127,19 @@ std::vector<std::vector<uint8_t>> Encoder::findAllSymbolsWithSuffix(const std::s
 }
 
 bool Encoder::isEscapable(uint8_t byte) const {
-    return reinterpret_cast<bool*>(&encoder->symbolTable->symbols[255])[byte];
+    // A byte is encoded as ESC + literal iff FSST has no single-byte symbol for it.
+    // The previous `reinterpret_cast<bool*>(&symbols[255])[byte]` read up to 256 bytes past
+    // symbols[255] (16-byte Symbols) into unrelated memory, returning spurious true for bytes
+    // that DO have a single-byte symbol -> %contains% false negatives.
+    const libfsst::Symbol* symbols = encoder->symbolTable->symbols;
+    const uint16_t nSymbols = encoder->symbolTable->nSymbols;
+    for (uint16_t i = 0; i < nSymbols; ++i) {
+        if (symbols[i].length() == 1 &&
+            reinterpret_cast<const uint8_t*>(symbols[i].val.str)[0] == byte) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::array<std::optional<uint8_t>, 3> Bitmap::getExactPrefixMatches(const std::span<const uint8_t> &string, size_t current, const Encoder &encoder) const {
