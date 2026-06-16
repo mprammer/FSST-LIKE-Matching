@@ -22,6 +22,7 @@
 
 #include "encoder.hpp"
 #include <fmt/format.h>
+#include <cassert>
 
 Bitmap Encoder::createAnywhereBitmap(uint8_t byte) const {
     Bitmap bitmap{};
@@ -162,6 +163,13 @@ std::array<std::optional<uint8_t>, 3> Bitmap::getExactPrefixMatches(const std::s
             default:
                 symBytes = reinterpret_cast<const uint8_t*>(symbol.val.str);
                 if (current + 2 < string.size() && symBytes[1] == string[current + 1] && symBytes[2] == string[current + 2]) {
+                    // %contains% correctness depends on FSST's Unique Prefix property: at most one
+                    // >=3-byte symbol shares any given 3-byte prefix (FSST keys long symbols by a
+                    // single 3-byte hash slot). If two ever collided here, keeping only the last
+                    // would silently drop the other decomposition -> undercount. Fail loudly in
+                    // debug instead. (NDEBUG strips this; release behaviour is unchanged.)
+                    assert(!exact_match[2].has_value() &&
+                           "FSST Unique Prefix violated: two >=3-byte symbols share a 3-byte prefix");
                     exact_match[2] = i;
                 }
                 break;
