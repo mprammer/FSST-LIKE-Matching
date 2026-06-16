@@ -202,53 +202,82 @@ std::vector<automata::State*> automata::percentage::initialisePseudoEnds(FiniteA
 void automata::percentage::constructSuffixAutomaton(
     const std::span<const uint8_t> &pattern, const Encoder &encoder, FiniteAutomaton* automaton, const std::vector<State*>& pseudoEnds, State* startState
 ) {
-    size_t strOutSize = 2 * pattern.size() + 7;
-    std::unique_ptr<libfsst::u8[]> strOutArray = std::make_unique<libfsst::u8[]>(strOutSize);
-    libfsst::u8* strOut = strOutArray.get();
-    size_t lenOut;
-    std::unique_ptr<libfsst::u8[]> buffer = std::make_unique<libfsst::u8[]>(strOutSize);
-    encoder.encode(pattern.size(), pattern.data(), strOutSize, buffer.get(), &lenOut, &strOut);
-    if (encoder.isEncodingValid(strOut, lenOut)) {
-        State* currentState = startState;
-
-        for (size_t idx = lenOut - 1; idx >= 1; --idx) {
-            State* transitionState = automaton->createState();
-            currentState->addTransition(strOut[idx], transitionState);
-            currentState->level = idx + 1;
-            currentState = transitionState;
-        }
-        currentState->level = 1;
-        currentState->addTransition(strOut[0], pseudoEnds[0]);
-
-    }
-
-    uint8_t max_n = pattern.size() >= 8 ? 7 : pattern.size();
-    std::vector<std::vector<uint8_t>> suffixesStarts = encoder.findAllSymbolsWithSuffix(pattern,  max_n);
-    for (uint8_t lenSuffix = 1; lenSuffix <= max_n; ++lenSuffix) {
-        if (suffixesStarts[lenSuffix - 1].empty()) {
-            continue;
-        }
-        encoder.encode(pattern.size() - lenSuffix, pattern.data() + lenSuffix, strOutSize, buffer.get(), &lenOut, &strOut);
-        if (!encoder.isEncodingValid(strOut, lenOut)) {
-            continue;
-        }
-
-        State* currentState = startState;;
-        for (int64_t idx = static_cast<int64_t>(lenOut) - 1; idx >= 0; --idx) {
-            if (!currentState->canTransition(strOut[idx])) {
-                State* transitionState = automaton->createState();
-                currentState->addTransition(strOut[idx], transitionState);
+    // Byte-level backward matcher. q[r] is the state reached when r pattern bytes (counted from
+    // the RIGHT) still have to be matched; reading a code backward consumes bytes off the LEFT of
+    // the unmatched region. For every symbol whose decompressed bytes line up with the pattern at
+    // this position we add a backward transition; a symbol that extends before the pattern start
+    // ("straddle") accepts via the pseudo-end states (which already perform the one-byte escape
+    // lookahead). This accepts exactly the code sequences whose decompressed tail equals `pattern`,
+    // for ANY decomposition -- not just FSST's greedy one.
+    //
+    // It replaces the original construction, which built a backward chain for only the greedy
+    // encoding of the pattern and so missed rows whose tail is encoded with shorter symbols (e.g.
+    // %cation matched as [c][a][t][ion] where greedy is [c][at][ion]). Unique Prefix still holds,
+    // but a substring's tail decomposes many ways depending on the bytes that precede it.
+    const size_t patLen = pattern.size();
+    const uint8_t* pat = pattern.data();
+    std::vector<State*> q(patLen + 1, nullptr);
+    std::function<State*(size_t)> build = [&](size_t r) -> State* {
+        if (q[r] != nullptr) return q[r];
+        State* s = (r == patLen) ? startState : automaton->createState();
+        q[r] = s;
+        // level(s) = minimum number of codes that must be read (backward) from s to reach an
+        // accept. It is exactly min over s's transitions of (dest->level + 1), which is a true
+        // lower bound, so the parse's `remaining >= level` early-rejection never drops a match.
+        uint64_t lvl = UINT64_MAX;
+        const uint16_t nSym = encoder.nSymbols();
+        for (uint16_t code = 0; code < nSym; ++code) {
+            const libfsst::Symbol& sym = encoder.symbols()[code];
+            const uint8_t symLen = sym.length();
+            if (symLen == 0) continue;
+            const uint8_t* symBytes = reinterpret_cast<const uint8_t*>(sym.val.str);
+            if (symLen <= r) {
+                // symbol lies entirely within the still-unmatched region pat[r-symLen : r]
+                if (std::memcmp(symBytes, pat + (r - symLen), symLen) == 0 && !s->canTransition(static_cast<uint8_t>(code))) {
+                    State* dest = (symLen == r) ? pseudoEnds[0] : build(r - symLen);
+                    s->addTransition(static_cast<uint8_t>(code), dest);
+                    lvl = std::min(lvl, dest->level + 1);
+                }
+            } else {
+                // symbol straddles the pattern start: its last r bytes must equal pat[0:r]
+                const uint8_t startIndex = static_cast<uint8_t>(symLen - r);
+                if (startIndex < pseudoEnds.size()
+                    && std::memcmp(symBytes + startIndex, pat, r) == 0 && !s->canTransition(static_cast<uint8_t>(code))) {
+                    State* dest = pseudoEnds[startIndex];
+                    s->addTransition(static_cast<uint8_t>(code), dest);
+                    lvl = std::min(lvl, dest->level + 1);
+                }
             }
-            currentState->level = std::min(currentState->level, static_cast<uint64_t>(idx) + 2);
-            currentState = currentState->transition(strOut[idx]);
         }
-
-        currentState->level = 1;
-        for (uint8_t symbol: suffixesStarts[lenSuffix - 1]) {
-            uint8_t startIndex = encoder.symbols()[symbol].length() - lenSuffix;
-            currentState->addTransition(symbol, pseudoEnds[startIndex]);
+        // Interior escape: pat[r-1] has no single-byte symbol, so it is stored as [255, byte];
+        // read backward that is `byte` then FSST_ESC. The literal byte's code equals its value and
+        // can collide with a real symbol code, so if a symbol transition already exists on that
+        // code we merge -- keep the symbol-interpretation transitions, but route FSST_ESC to the
+        // literal continuation (a trailing 255 means the byte was a literal, not a symbol).
+        if (encoder.isEscapable(pat[r - 1])) {
+            State* next = (r == 1) ? pseudoEnds[0] : build(r - 1);
+            const uint8_t lit = pat[r - 1];
+            if (s->canTransition(lit)) {
+                State* existing = s->transition(lit);
+                State* merged = automaton->createState();
+                merged->defaultTransition = existing->defaultTransition;
+                merged->copyTransitions(existing);
+                merged->transitions[FSST_ESC] = next;
+                merged->level = std::min(existing->level, next->level + 1);
+                s->transitions[lit] = merged;
+                lvl = std::min(lvl, merged->level + 1);
+            } else {
+                State* mid = automaton->createState();
+                mid->addTransition(FSST_ESC, next);
+                mid->level = next->level + 1;
+                s->addTransition(lit, mid);
+                lvl = std::min(lvl, mid->level + 1);
+            }
         }
-    }
+        s->level = (lvl == UINT64_MAX) ? 1 : lvl;
+        return s;
+    };
+    build(patLen);
 }
 
 automata::State* automata::percentage::constructCachedPrefixAutomaton(
@@ -319,9 +348,11 @@ automata::State* automata::percentage::constructCachedPrefixAutomaton(
                 break;
             }
 
-            // nothing is prefixed by `current_byte next_byte`
-            // this means it is not a standalone symbol, either
-            if (!n_char_sym[1].has_value() && (n_char_sym[0].has_value() || encoder.isEscapable(current_byte))) {
+            // `current_byte` as a single byte (then continue), IN ADDITION to the 2-byte
+            // `prefixes` below. A needle byte-run can be encoded as the 2-byte symbol OR as the
+            // single byte depending on the row's continuation; upstream gated this on
+            // `!n_char_sym[1]`, dropping the single-byte encoding whenever a 2-byte symbol existed.
+            if (n_char_sym[0].has_value() || encoder.isEscapable(current_byte)) {
                 State* next = constructCachedPrefixAutomaton(
                     pattern, index + 1, encoder, precomputedEnds, createState, enableCaching, cache, errorState, currentStates, nullptr
                 );
@@ -364,31 +395,26 @@ automata::State* automata::percentage::constructCachedPrefixAutomaton(
                 }
             }
 
-            // our longer-than-3 prefix completely is within the match
-            // as such, we must encode it as such
+            // The >=3-byte symbol matching here is unique (FSST's unique-prefix property); keep
+            // upstream's single-symbol handling but do NOT `break` -- the same bytes are encoded
+            // with shorter symbols in other rows (continuation-dependent greedy choice), so emit
+            // this transition AND fall through to the shorter decompositions below.
             if (full_match) {
                 if (encoder.symbols()[n_char_sym[2].value()].length() < pattern.size() - index) {
                     State* transitionState = constructCachedPrefixAutomaton(
                         pattern, index + encoder.symbols()[n_char_sym[2].value()].length(), encoder, precomputedEnds, createState, enableCaching, cache, errorState, currentStates, nullptr
                     );
-
                     if (transitionState != nullptr) {
                         transitions.emplace_back(n_char_sym[2].value(), transitionState);
                     }
-                    break;
-                }
-                uint8_t usedBytes = static_cast<uint8_t>(pattern.size() - index);
-                uint8_t remainingBytes = encoder.symbols()[n_char_sym[2].value()].length() - usedBytes;
-                endTransitions.emplace_back(n_char_sym[2].value(), usedBytes);
-                if (remainingBytes == 0) {
-                    break;
+                } else {
+                    uint8_t usedBytes = static_cast<uint8_t>(pattern.size() - index);
+                    endTransitions.emplace_back(n_char_sym[2].value(), usedBytes);
                 }
             }
 
-
-            // we don't match the >=3 length prefix => how do we encode, then?
-            // can be done deterministically
-            // `current_byte next_byte` is a symbol => we encode it as such
+            // Shorter decompositions, emitted IN ADDITION to the >=3-byte symbol above and to
+            // each other (upstream chose exactly one via if/else, then `break`ed).
             if (n_char_sym[1].has_value()) {
                 State* transitionState = constructCachedPrefixAutomaton(
                     pattern, index + 2, encoder, precomputedEnds, createState, enableCaching, cache, errorState, currentStates, nullptr
@@ -396,19 +422,18 @@ automata::State* automata::percentage::constructCachedPrefixAutomaton(
                 if (transitionState != nullptr) {
                     transitions.emplace_back(n_char_sym[1].value(), transitionState);
                 }
-            } else {
-                if (n_char_sym[0].has_value() || encoder.isEscapable(current_byte)) {
-                    State* transitionState = constructCachedPrefixAutomaton(
-                        pattern, index + 1, encoder, precomputedEnds, createState, enableCaching, cache, errorState, currentStates, nullptr
-                    );
-                    if (transitionState != nullptr) {
-                        if (n_char_sym[0].has_value()) {
-                            transitions.emplace_back(n_char_sym[0].value(), transitionState);
-                        } else {
-                            State* intermediaryState = createState();
-                            intermediaryState->addTransition(current_byte, transitionState);
-                            transitions.emplace_back(FSST_ESC, intermediaryState);
-                        }
+            }
+            if (n_char_sym[0].has_value() || encoder.isEscapable(current_byte)) {
+                State* transitionState = constructCachedPrefixAutomaton(
+                    pattern, index + 1, encoder, precomputedEnds, createState, enableCaching, cache, errorState, currentStates, nullptr
+                );
+                if (transitionState != nullptr) {
+                    if (n_char_sym[0].has_value()) {
+                        transitions.emplace_back(n_char_sym[0].value(), transitionState);
+                    } else {
+                        State* intermediaryState = createState();
+                        intermediaryState->addTransition(current_byte, transitionState);
+                        transitions.emplace_back(FSST_ESC, intermediaryState);
                     }
                 }
             }
